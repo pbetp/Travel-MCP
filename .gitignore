@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+
+# Local MCP config with machine-specific absolute paths. Copy .mcp.json.example to .mcp.json and edit.
+.mcp.json

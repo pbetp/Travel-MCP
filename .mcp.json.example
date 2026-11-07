@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "thai-travel": {
+      "command": "C:\\path\\to\\thai-travel-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\thai-travel-mcp\\server.py"]
+    }
+  }
+}
