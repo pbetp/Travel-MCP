@@ -9,10 +9,14 @@ How it works
 
 Data sources (all free, no API key): Open-Meteo (weather, geocoding), OpenStreetMap (places),
 Nominatim (backup geocoder).
+
+Where it runs: on your own computer (Claude Code starts it and talks to it over stdio), or on a
+cloud host over HTTP so Claude can reach it from any device. See the last lines of this file.
 """
 
 import datetime as dt
 import math
+import os
 from typing import Any, Literal
 from urllib.parse import urlencode
 
@@ -37,7 +41,13 @@ name more specific and search again.
 - OpenStreetMap data is volunteer-edited and may be incomplete or out of date.
 """
 
-mcp = FastMCP("thai-travel", instructions=INSTRUCTIONS)
+# Cloud hosts such as Render set the PORT variable. If it is set, the server speaks HTTP on that port.
+PORT = os.environ.get("PORT")
+
+# host 0.0.0.0 = accept requests from other machines (only matters in HTTP mode)
+# stateless_http = keep no memory between requests, so the cloud server can sleep and restart safely
+# shortcut: no login, anyone who knows the URL can call the tools; add auth before sharing the URL widely
+mcp = FastMCP("travel-mcp", instructions=INSTRUCTIONS, host="0.0.0.0", port=int(PORT or 8000), stateless_http=True)
 
 # The tools only read data from websites and never change anything, so they are safe to call repeatedly
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
@@ -47,10 +57,9 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 # ---------------------------------------------------------------------------
 
 # Free services ask clients to say who they are
-HEADERS = {"User-Agent": "thai-travel-mcp/1.0 (open-source learning project)"}
+HEADERS = {"User-Agent": "travel-mcp/1.0 (open-source learning project)"}
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-GEOCODE_BY_ID_URL = "https://geocoding-api.open-meteo.com/v1/get"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -60,18 +69,6 @@ OVERPASS_URLS = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 MAX_RESULTS = 1000  # most places we ask Overpass for in one query
-
-# Nicknames that the geocoders do not understand (found by testing them)
-ALIASES = {
-    "กทม": "กรุงเทพมหานคร",
-    "กทม.": "กรุงเทพมหานคร",
-    "กรุงเทพฯ": "กรุงเทพมหานคร",
-    "บางกอก": "กรุงเทพมหานคร",
-    "bkk": "Bangkok",
-    "อยุธยา": "พระนครศรีอยุธยา",
-    "โคราช": "นครราชสีมา",
-    "สิงคโปร์": "Singapore",  # the Thai spelling finds the middle of the island, not the city
-}
 
 # Weather codes (WMO standard) used by Open-Meteo -> description
 WEATHER_CODES = {
@@ -106,14 +103,13 @@ PLACE_FILTERS = {
 
 
 def geocode(query: str) -> dict[str, Any]:
-    """Find the coordinates of a place. Open-Meteo first (good with cities), then Nominatim (finds
-    neighbourhoods and landmarks such as "Patong")."""
+    """Find the coordinates of a place. Open-Meteo first (fast, knows cities by their English name),
+    then Nominatim as the backup (finds neighbourhoods, landmarks and names in other languages,
+    such as "Nimmanhaemin" or "เชียงใหม่")."""
     text = " ".join(query.split())
     if not text:
         raise ValueError("Please provide a city or place name.")
-    text = ALIASES.get(text.casefold(), text)
 
-    place = None
     service_down = False
     for finder in (_find_with_open_meteo, _find_with_nominatim):
         try:
@@ -137,20 +133,12 @@ def _country_too_broad(name: str) -> ValueError:
 
 
 def _find_with_open_meteo(text: str) -> dict[str, Any] | None:
-    # Open-Meteo only matches names written in the language we ask for (tested: Thai text finds
-    # nothing with language=en), so Thai input is searched in Thai and then translated by id.
-    is_thai = any(0x0E00 <= ord(ch) <= 0x0E7F for ch in text)
-    data = _get_json(GEOCODE_URL, {"name": text, "count": 5, "language": "th" if is_thai else "en"})
+    data = _get_json(GEOCODE_URL, {"name": text, "count": 5, "language": "en"})
     results = [r for r in data.get("results", []) if r.get("feature_code") != "AIRP"]  # skip airports
     if not results:
         return None
 
     best = results[0]
-    if is_thai:
-        try:  # noqa: SIM105
-            best = _get_json(GEOCODE_BY_ID_URL, {"id": best["id"], "language": "en"})
-        except (httpx.HTTPError, KeyError):
-            pass  # keep the Thai record: still usable, just not translated
     if best.get("feature_code", "").startswith("PCL"):  # PCL = a country
         raise _country_too_broad(best["name"])
 
@@ -215,6 +203,8 @@ def get_weather(location: str, days: int = 3, start_date: dt.date | None = None)
     if start_date is None:
         params["forecast_days"] = days
     else:
+        # shortcut: "today" is the server's date (UTC in the cloud), so around midnight it can be one
+        # day off for the user; compare in the place's own timezone if that ever matters
         today = dt.date.today()
         end_date = start_date + dt.timedelta(days=days - 1)
         if start_date < today:
@@ -281,15 +271,23 @@ def overpass(filters: list[str], place: dict[str, Any], radius_km: float) -> lis
             resp = httpx.post(url, data={"data": query}, headers=HEADERS, timeout=45)
             resp.raise_for_status()
             data = resp.json()
-        except (httpx.HTTPError, ValueError):
-            continue  # this server failed or is too busy, try the next one
-        if "error" in data.get("remark", ""):  # the query ran out of time, so the result is incomplete
-            continue
-        return data["elements"]
+            if "error" in data.get("remark", ""):  # the query ran out of time, so the result is incomplete
+                continue
+            return data["elements"]
+        except (httpx.HTTPError, ValueError, KeyError):
+            continue  # this server failed, is too busy or sent a broken answer: try the next one
     raise RuntimeError(
         "The map server (OpenStreetMap/Overpass) is not responding. This happens often with free public "
         "servers. Please try again shortly, or use a smaller radius."
     )
+
+
+def check_search_size(radius_km: float, limit: int) -> None:
+    """Reject sizes that make no sense or that would overload the free map servers."""
+    if not 0 < radius_km <= 25:
+        raise ValueError("radius_km must be more than 0 and at most 25.")
+    if not 1 <= limit <= 50:
+        raise ValueError("limit must be between 1 and 50.")
 
 
 def read_places(elements: list[dict[str, Any]], place: dict[str, Any]) -> list[tuple[dict[str, str], float]]:
@@ -368,13 +366,15 @@ def search_hotels(
         lodging_type: hotel, hostel, guest_house, motel, apartment, or any (all types).
         min_stars: Minimum star rating, 0 = no filter. If set, only places with star data remain.
         sort_by: 'distance' = nearest to the centre first, 'stars' = most stars first.
-        radius_km: Search radius around the centre, in km.
-        limit: Maximum number of places to return.
+        radius_km: Search radius around the centre, in km (at most 25).
+        limit: Maximum number of places to return, 1-50.
         check_in: Check-in date (YYYY-MM-DD), used to fill in the booking links.
         check_out: Check-out date (YYYY-MM-DD). Default: one night after check-in.
         adults: Number of adults, used in the booking links.
     """
-    check_in, check_out = _check_stay_dates(check_in, check_out)  # fail fast, before using the network
+    # Check the request first, so mistakes are reported instantly without using the network
+    check_search_size(radius_km, limit)
+    check_in, check_out = _check_stay_dates(check_in, check_out)
     place = geocode(location)
 
     types = LODGING_TAGS if lodging_type == "any" else [lodging_type]
@@ -399,10 +399,11 @@ def search_hotels(
             }
         )
 
+    hotels.sort(key=lambda h: h["distance_km"])
     if sort_by == "stars":
-        hotels.sort(key=lambda h: (h["stars"] is None, -(h["stars"] or 0), h["distance_km"]))
-    else:
-        hotels.sort(key=lambda h: h["distance_km"])
+        # Python's sort keeps equal items in their old order, so places with the same stars stay
+        # nearest first. No star data counts as 0, which puts those places last.
+        hotels.sort(key=lambda h: h["stars"] or 0, reverse=True)
 
     booking = {"ss": place["search_text"], "group_adults": adults, "no_rooms": 1}
     if check_in and check_out:
@@ -459,9 +460,10 @@ def find_places(
         category: attraction (sights, museums, viewpoints), temple (Buddhist temples), restaurant, cafe,
             market, shopping (malls), park, nightlife (bars, pubs, clubs).
         sort_by: 'popular' = best-known first (good for sights), 'distance' = nearest to the centre first.
-        radius_km: Search radius around the centre, in km.
-        limit: Maximum number of places to return.
+        radius_km: Search radius around the centre, in km (at most 25).
+        limit: Maximum number of places to return, 1-50.
     """
+    check_search_size(radius_km, limit)  # fail fast, before using the network
     place = geocode(location)
     elements = overpass([PLACE_FILTERS[category]], place, radius_km)
 
@@ -482,11 +484,11 @@ def find_places(
             }
         )
 
+    places.sort(key=lambda p: p["distance_km"])
     if sort_by == "popular":
-        # Sorting by distance alone would fill the list with minor places that happen to be near the centre
-        places.sort(key=lambda p: (-p["popularity_score"], p["distance_km"]))
-    else:
-        places.sort(key=lambda p: p["distance_km"])
+        # Distance alone would fill the list with minor places that happen to be near the centre.
+        # Equally popular places stay nearest first (Python's sort keeps equal items in order).
+        places.sort(key=lambda p: p["popularity_score"], reverse=True)
     return {
         "location": place,
         "category": category,
@@ -521,4 +523,5 @@ and prefer indoor activities on days with a high chance of rain.
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # In the cloud (PORT is set): serve HTTP at /mcp. On your own computer: stdio, started by Claude Code.
+    mcp.run(transport="streamable-http" if PORT else "stdio")

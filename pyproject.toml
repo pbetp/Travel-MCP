@@ -1,16 +1,4 @@
-[project]
-name = "thai-travel-mcp"
-version = "1.0.0"
-description = "MCP server for travel planning: weather, accommodation and places worldwide, from free open data"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "mcp>=1.10,<2", # 1.10+ supports structured output; <2 avoids a future breaking release
-    "httpx>=0.27",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=8"]
+# Settings for the linter (ruff) and the test runner (pytest). Dependencies are in requirements.txt.
 
 [tool.ruff]
 line-length = 120

@@ -17,7 +17,6 @@ import server
 # ---------- fake web ----------
 
 GEOCODE = server.GEOCODE_URL
-GEOCODE_BY_ID = server.GEOCODE_BY_ID_URL
 NOMINATIM = server.NOMINATIM_URL
 FORECAST = server.FORECAST_URL
 OVERPASS_1, OVERPASS_2 = server.OVERPASS_URLS
@@ -67,7 +66,6 @@ CHIANG_MAI = {
     "id": 1153671, "name": "Chiang Mai", "latitude": 18.79038, "longitude": 98.98468,
     "feature_code": "PPLA", "admin1": "Chiang Mai Province", "country": "Thailand",
 }  # fmt: skip
-CHIANG_MAI_THAI = {**CHIANG_MAI, "name": "เชียงใหม่", "admin1": "จังหวัดเชียงใหม่", "country": "ไทย"}
 
 
 def node(osm_id, lat, lon, **tags):
@@ -99,26 +97,16 @@ def test_english_name_is_found_with_one_request(web):
     assert web.calls[0][1]["language"] == "en"
 
 
-def test_thai_name_is_searched_in_thai_but_returned_in_english(web):
-    # Seen for real: Open-Meteo finds nothing for Thai text when language=en
-    web.on(GEOCODE, lambda params: {"results": [CHIANG_MAI_THAI]} if params["language"] == "th" else {})
-    web.on(GEOCODE_BY_ID, CHIANG_MAI)
+def test_thai_name_is_found_by_the_backup_and_returned_in_english(web):
+    # Seen for real: Open-Meteo finds nothing for Thai text, Nominatim finds it
+    web.on(GEOCODE, {})
+    web.on(NOMINATIM, [{"name": "Chiang Mai City Municipality", "display_name": "Chiang Mai, Thailand",
+                        "lat": "18.79", "lon": "98.98", "addresstype": "city"}])  # fmt: skip
 
     place = server.geocode("เชียงใหม่")
 
-    assert place["name"] == "Chiang Mai"
-    assert web.calls[0][1]["language"] == "th"
-    assert web.calls[1][1] == {"id": 1153671, "language": "en"}
-
-
-def test_nickname_is_expanded(web):
-    web.on(GEOCODE, {"results": [{**CHIANG_MAI, "name": "Bangkok"}]})
-    web.on(GEOCODE_BY_ID, 500)  # translation fails: the Thai record is kept
-
-    place = server.geocode("กทม")
-
-    assert web.calls[0][1]["name"] == "กรุงเทพมหานคร"
-    assert place["search_text"] == "กรุงเทพมหานคร"
+    assert place["name"] == "Chiang Mai City Municipality"
+    assert web.calls[1][1]["accept-language"] == "en"
 
 
 def test_nominatim_is_the_backup_for_neighbourhoods(web):
@@ -286,6 +274,14 @@ def test_places_can_be_sorted_by_distance(web):
     result = server.find_places("Chiang Mai", "temple", sort_by="distance")
 
     assert [p["name"] for p in result["places"]] == ["วัดเล็กใกล้ๆ", "Wat Phra Singh"]
+
+
+def test_bad_radius_or_limit_is_rejected_before_using_the_network(web):
+    with pytest.raises(ValueError, match="radius_km"):
+        server.search_hotels("Chiang Mai", radius_km=-2)
+    with pytest.raises(ValueError, match="limit"):
+        server.find_places("Chiang Mai", "temple", limit=-1)  # used to silently drop the last result
+    assert web.calls == []
 
 
 # ---------- Overpass servers ----------
